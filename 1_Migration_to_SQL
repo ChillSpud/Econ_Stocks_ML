@@ -1,0 +1,431 @@
+"""
+Complete Stock & Economic Data Migration System to SQLite
+This script migrates Excel/CSV stock data and FRED economic data to an SQL database
+"""
+
+import sqlite3
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from fredapi import Fred
+import time
+
+class FinancialDataMigrator:
+    """Handles migration of financial data from various sources to SQLite database"""
+    
+    def __init__(self, db_path='financial_data.db', fred_api_key=None):
+        """
+        Initialize the migrator
+        
+        Args:
+            db_path: Path to SQLite database file
+            fred_api_key: Your FRED API key
+        """
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.fred = Fred(api_key=fred_api_key) if fred_api_key else None
+        self.create_tables()
+        
+    def create_tables(self):
+        """Create database schema for financial data"""
+        cursor = self.conn.cursor()
+        
+        # Stock prices table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            date DATE NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            adj_close REAL,
+            volume INTEGER,
+            data_source TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ticker, date)
+        )
+        """)
+        
+        # Stock metadata table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_metadata (
+            ticker TEXT PRIMARY KEY,
+            company_name TEXT,
+            sector TEXT,
+            industry TEXT,
+            market_cap REAL,
+            country TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        # Financial statements table (from your DCF code)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS financial_statements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            statement_type TEXT NOT NULL,  -- 'income', 'balance_sheet', 'cash_flow'
+            calendar_year INTEGER NOT NULL,
+            fiscal_period TEXT,  -- 'FY', 'Q1', 'Q2', 'Q3', 'Q4'
+            metric_name TEXT NOT NULL,
+            metric_value REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ticker, statement_type, calendar_year, fiscal_period, metric_name)
+        )
+        """)
+        
+        # Economic indicators table (from your FRED code)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS economic_indicators (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            indicator_code TEXT NOT NULL,
+            indicator_name TEXT NOT NULL,
+            date DATE NOT NULL,
+            value REAL,
+            frequency TEXT,  -- 'daily', 'monthly', 'quarterly', 'annual'
+            category TEXT,  -- 'labor', 'consumer', 'manufacturing', etc.
+            source TEXT DEFAULT 'FRED',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(indicator_code, date)
+        )
+        """)
+        
+        # Indices data table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS market_indices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            index_name TEXT NOT NULL,
+            date DATE NOT NULL,
+            close REAL,
+            adj_close REAL,
+            volume INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(index_name, date)
+        )
+        """)
+        
+        # Create indices for faster queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_ticker_date ON stock_prices(ticker, date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_econ_code_date ON economic_indicators(indicator_code, date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fin_stmt ON financial_statements(ticker, statement_type, calendar_year)")
+        
+        self.conn.commit()
+        print("✓ Database schema created successfully")
+    
+    def migrate_stock_excel(self, file_path, ticker, data_type='FY'):
+        """
+        Migrate financial statements from Excel files (like your ADI_FY.xlsx)
+        
+        Args:
+            file_path: Path to Excel file
+            ticker: Stock ticker symbol
+            data_type: 'FY' for fiscal year, 'QTY' for quarterly
+        """
+        try:
+            # Read all sheets
+            fin_stat = pd.read_excel(file_path, index_col=0, 
+                                    sheet_name=['Income Statement', 'Balance Sheet', 'Cash Flow'])
+            
+            records = []
+            
+            # Process each statement type
+            for stmt_type, df in fin_stat.items():
+                stmt_key = stmt_type.lower().replace(' ', '_')
+                
+                # Get calendar years from columns
+                years = df.loc['calendarYear'].values if 'calendarYear' in df.index else df.columns
+                
+                # Iterate through each metric (row) and year (column)
+                for metric_name in df.index:
+                    if metric_name == 'calendarYear':
+                        continue
+                    
+                    for i, year in enumerate(years):
+                        try:
+                            value = df.iloc[df.index.get_loc(metric_name), i]
+                            if pd.notna(value):
+                                records.append({
+                                    'ticker': ticker,
+                                    'statement_type': stmt_key,
+                                    'calendar_year': int(year),
+                                    'fiscal_period': data_type,
+                                    'metric_name': metric_name,
+                                    'metric_value': float(value)
+                                })
+                        except (ValueError, TypeError):
+                            continue
+            
+            # Insert into database
+            df_records = pd.DataFrame(records)
+            df_records.to_sql('financial_statements', self.conn, if_exists='append', 
+                            index=False, method='multi')
+            
+            print(f"✓ Migrated {len(records)} financial statement records for {ticker}")
+            return len(records)
+            
+        except Exception as e:
+            print(f"✗ Error migrating {file_path}: {str(e)}")
+            return 0
+    
+    def migrate_stock_csv(self, file_path, ticker=None, index_name=None):
+        """
+        Migrate stock prices from CSV files
+        
+        Args:
+            file_path: Path to CSV file
+            ticker: Stock ticker (if it's a stock)
+            index_name: Index name (if it's an index like 'SPY', 'NDX')
+        """
+        try:
+            df = pd.read_csv(file_path)
+            
+            # Standardize column names
+            df.columns = df.columns.str.lower().str.replace(' ', '_')
+            
+            # Convert date to proper format
+            df['date'] = pd.to_datetime(df['date'])
+            
+            if ticker:
+                # Stock data
+                df['ticker'] = ticker
+                df['data_source'] = 'CSV'
+                
+                # Select and rename columns
+                columns_map = {
+                    'date': 'date',
+                    'open': 'open',
+                    'high': 'high', 
+                    'low': 'low',
+                    'close': 'close',
+                    'adj_close': 'adj_close',
+                    'volume': 'volume'
+                }
+                
+                df_clean = df.rename(columns=columns_map)[list(columns_map.values()) + ['ticker', 'data_source']]
+                df_clean.to_sql('stock_prices', self.conn, if_exists='append', 
+                              index=False, method='multi')
+                
+                print(f"✓ Migrated {len(df_clean)} price records for {ticker}")
+                
+            elif index_name:
+                # Index data
+                df['index_name'] = index_name
+                
+                columns = ['date', 'close', 'adj_close', 'volume', 'index_name']
+                df_clean = df[columns]
+                df_clean.to_sql('market_indices', self.conn, if_exists='append',
+                              index=False, method='multi')
+                
+                print(f"✓ Migrated {len(df_clean)} records for index {index_name}")
+            
+            return len(df)
+            
+        except Exception as e:
+            print(f"✗ Error migrating {file_path}: {str(e)}")
+            return 0
+    
+    def migrate_fred_data(self, indicator_configs):
+        """
+        Migrate economic indicators from FRED
+        
+        Args:
+            indicator_configs: List of dicts with structure:
+                [{'code': 'PAYEMS', 'name': 'Non-farm Payrolls', 
+                  'category': 'labor', 'frequency': 'monthly'}, ...]
+        """
+        if not self.fred:
+            print("✗ FRED API key not provided")
+            return 0
+        
+        total_records = 0
+        
+        for config in indicator_configs:
+            try:
+                code = config['code']
+                name = config['name']
+                category = config.get('category', 'general')
+                frequency = config.get('frequency', 'monthly')
+                
+                # Get data from FRED
+                series = self.fred.get_series(code)
+                
+                # Prepare records
+                records = []
+                for date, value in series.items():
+                    if pd.notna(value):
+                        records.append({
+                            'indicator_code': code,
+                            'indicator_name': name,
+                            'date': date,
+                            'value': float(value),
+                            'frequency': frequency,
+                            'category': category,
+                            'source': 'FRED'
+                        })
+                
+                # Insert into database
+                df = pd.DataFrame(records)
+                df.to_sql('economic_indicators', self.conn, if_exists='append',
+                         index=False, method='multi')
+                
+                total_records += len(records)
+                print(f"✓ Migrated {len(records)} records for {name} ({code})")
+                
+                # Rate limiting
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"✗ Error migrating {code}: {str(e)}")
+                continue
+        
+        print(f"\n✓ Total FRED records migrated: {total_records}")
+        return total_records
+    
+    def add_stock_metadata(self, ticker, company_name=None, sector=None, 
+                          industry=None, market_cap=None, country='USA'):
+        """Add or update stock metadata"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+        INSERT OR REPLACE INTO stock_metadata 
+        (ticker, company_name, sector, industry, market_cap, country, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, company_name, sector, industry, market_cap, country, 
+              datetime.now()))
+        self.conn.commit()
+    
+    def query_stock_prices(self, ticker, start_date=None, end_date=None):
+        """Query stock prices for a ticker"""
+        query = "SELECT * FROM stock_prices WHERE ticker = ?"
+        params = [ticker]
+        
+        if start_date:
+            query += " AND date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND date <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY date"
+        
+        return pd.read_sql_query(query, self.conn, params=params)
+    
+    def query_economic_indicator(self, indicator_code, start_date=None, end_date=None):
+        """Query economic indicator data"""
+        query = "SELECT * FROM economic_indicators WHERE indicator_code = ?"
+        params = [indicator_code]
+        
+        if start_date:
+            query += " AND date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND date <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY date"
+        
+        return pd.read_sql_query(query, self.conn, params=params)
+    
+    def get_database_summary(self):
+        """Get summary statistics of the database"""
+        cursor = self.conn.cursor()
+        
+        summary = {}
+        
+        # Stock prices
+        cursor.execute("SELECT COUNT(*), COUNT(DISTINCT ticker) FROM stock_prices")
+        total_prices, unique_tickers = cursor.fetchone()
+        summary['stock_prices'] = {
+            'total_records': total_prices,
+            'unique_tickers': unique_tickers
+        }
+        
+        # Economic indicators
+        cursor.execute("SELECT COUNT(*), COUNT(DISTINCT indicator_code) FROM economic_indicators")
+        total_econ, unique_indicators = cursor.fetchone()
+        summary['economic_indicators'] = {
+            'total_records': total_econ,
+            'unique_indicators': unique_indicators
+        }
+        
+        # Financial statements
+        cursor.execute("SELECT COUNT(*), COUNT(DISTINCT ticker) FROM financial_statements")
+        total_fin, unique_fin_tickers = cursor.fetchone()
+        summary['financial_statements'] = {
+            'total_records': total_fin,
+            'unique_tickers': unique_fin_tickers
+        }
+        
+        return summary
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+        print("✓ Database connection closed")
+
+
+# Example usage
+if __name__ == "__main__":
+    
+    # Initialize migrator
+    migrator = FinancialDataMigrator(
+        db_path='financial_data.db',
+        fred_api_key='YOUR_FRED_API_KEY_HERE'  # Replace with your actual key
+    )
+    
+    # Example 1: Migrate stock financial statements from Excel
+    # migrator.migrate_stock_excel(
+    #     file_path='ADI_FY.xlsx',
+    #     ticker='ADI',
+    #     data_type='FY'
+    # )
+    
+    # Example 2: Migrate stock prices from CSV
+    # migrator.migrate_stock_csv(
+    #     file_path='SPY_Monthly.csv',
+    #     ticker='SPY'
+    # )
+    
+    # Example 3: Migrate market index
+    # migrator.migrate_stock_csv(
+    #     file_path='NDX_Monthly.csv',
+    #     index_name='NASDAQ_100'
+    # )
+    
+    # Example 4: Add stock metadata
+    # migrator.add_stock_metadata(
+    #     ticker='ADI',
+    #     company_name='Analog Devices Inc.',
+    #     sector='Technology',
+    #     industry='Semiconductors',
+    #     market_cap=100e9
+    # )
+    
+    # Example 5: Migrate FRED economic data
+    fred_indicators = [
+        {'code': 'PAYEMS', 'name': 'Non-farm Payrolls', 'category': 'labor', 'frequency': 'monthly'},
+        {'code': 'UNRATE', 'name': 'Unemployment Rate', 'category': 'labor', 'frequency': 'monthly'},
+        {'code': 'CPIAUCSL', 'name': 'CPI', 'category': 'prices_inflation', 'frequency': 'monthly'},
+        {'code': 'FEDFUNDS', 'name': 'Fed Funds Rate', 'category': 'yields', 'frequency': 'monthly'},
+    ]
+    
+    # migrator.migrate_fred_data(fred_indicators)
+    
+    # Example 6: Query data
+    # aapl_prices = migrator.query_stock_prices('AAPL', start_date='2020-01-01')
+    # print(aapl_prices.head())
+    
+    # unemployment = migrator.query_economic_indicator('UNRATE', start_date='2020-01-01')
+    # print(unemployment.head())
+    
+    # Get database summary
+    summary = migrator.get_database_summary()
+    print("\n=== Database Summary ===")
+    for table, stats in summary.items():
+        print(f"\n{table}:")
+        for key, value in stats.items():
+            print(f"  {key}: {value:,}")
+    
+    migrator.close()

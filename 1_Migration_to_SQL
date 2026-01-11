@@ -28,7 +28,7 @@ class FinancialDataMigrator:
         self.create_tables()
         
     def create_tables(self):
-        """Create database schema for financial data"""
+        """Create database schema for financial and economic data"""
         cursor = self.conn.cursor()
         
         # Stock prices table
@@ -107,17 +107,18 @@ class FinancialDataMigrator:
         )
         """)
         
-        # Create indices for faster queries
+        # Create indices for faster queries; Creates an index only if it doesn't already exist (prevents errors if you run this code multiple times)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_ticker_date ON stock_prices(ticker, date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_econ_code_date ON economic_indicators(indicator_code, date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_fin_stmt ON financial_statements(ticker, statement_type, calendar_year)")
         
+        # Commit changes - permanently saves all pending changes to the database
         self.conn.commit()
         print("✓ Database schema created successfully")
     
-    def migrate_stock_excel(self, file_path, ticker, data_type='FY'):
+    def migrate_fin_stat_excel(self, file_path, ticker, data_type='FY'):
         """
-        Migrate financial statements from Excel files (like your ADI_FY.xlsx)
+        Migrate financial statements from Excel files
         
         Args:
             file_path: Path to Excel file

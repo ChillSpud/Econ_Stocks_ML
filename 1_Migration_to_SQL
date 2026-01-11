@@ -16,7 +16,7 @@ class FinancialDataMigrator:
     
     def __init__(self, db_path='financial_data.db', fred_api_key=None):
         """
-        Initialize the migrator
+        Initialize the data migrator
         
         Args:
             db_path: Path to SQLite database file
@@ -34,7 +34,7 @@ class FinancialDataMigrator:
         # Stock prices table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS stock_prices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ticker TEXT NOT NULL,
             date DATE NOT NULL,
             open REAL,
@@ -62,10 +62,10 @@ class FinancialDataMigrator:
         )
         """)
         
-        # Financial statements table (from your DCF code)
+        # Financial statements table (from DCF code)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS financial_statements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             ticker TEXT NOT NULL,
             statement_type TEXT NOT NULL,  -- 'income', 'balance_sheet', 'cash_flow'
             calendar_year INTEGER NOT NULL,
@@ -77,10 +77,10 @@ class FinancialDataMigrator:
         )
         """)
         
-        # Economic indicators table (from your FRED code)
+        # Economic indicators table (from FRED code)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS economic_indicators (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             indicator_code TEXT NOT NULL,
             indicator_name TEXT NOT NULL,
             date DATE NOT NULL,
@@ -93,10 +93,10 @@ class FinancialDataMigrator:
         )
         """)
         
-        # Indices data table
+        # Market indices data table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS market_indices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             index_name TEXT NOT NULL,
             date DATE NOT NULL,
             close REAL,
@@ -161,7 +161,7 @@ class FinancialDataMigrator:
             # Insert into database
             df_records = pd.DataFrame(records)
             df_records.to_sql('financial_statements', self.conn, if_exists='append', 
-                            index=False, method='multi')
+                            index=False)
             
             print(f"✓ Migrated {len(records)} financial statement records for {ticker}")
             return len(records)
@@ -206,7 +206,7 @@ class FinancialDataMigrator:
                 
                 df_clean = df.rename(columns=columns_map)[list(columns_map.values()) + ['ticker', 'data_source']]
                 df_clean.to_sql('stock_prices', self.conn, if_exists='append', 
-                              index=False, method='multi')
+                              index=False)
                 
                 print(f"✓ Migrated {len(df_clean)} price records for {ticker}")
                 
@@ -217,7 +217,7 @@ class FinancialDataMigrator:
                 columns = ['date', 'close', 'adj_close', 'volume', 'index_name']
                 df_clean = df[columns]
                 df_clean.to_sql('market_indices', self.conn, if_exists='append',
-                              index=False, method='multi')
+                              index=False)
                 
                 print(f"✓ Migrated {len(df_clean)} records for index {index_name}")
             
@@ -269,7 +269,7 @@ class FinancialDataMigrator:
                 # Insert into database
                 df = pd.DataFrame(records)
                 df.to_sql('economic_indicators', self.conn, if_exists='append',
-                         index=False, method='multi')
+                         index=False)
                 
                 total_records += len(records)
                 print(f"✓ Migrated {len(records)} records for {name} ({code})")

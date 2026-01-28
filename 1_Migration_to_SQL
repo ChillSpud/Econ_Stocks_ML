@@ -123,7 +123,7 @@ class FinancialDataMigrator:
         Args:
             file_path: Path to Excel file
             ticker: Stock ticker symbol
-            data_type: 'FY' for fiscal year, 'QTY' for quarterly
+            data_type: 'FY' for fiscal year, 'QTY' for quarterly 
         """
         try:
             # Read all sheets
